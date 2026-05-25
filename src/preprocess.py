@@ -1,21 +1,9 @@
-"""
-preprocess.py
--------------
-- Export pre/post-fire Landsat 8 image pairs from Google Earth Engine
-- SIFT-based alignment of image pairs
-- Band normalization
-"""
-
 import numpy as np
 import cv2
 import rasterio
-from rasterio.transform import from_bounds
 from pathlib import Path
 
-# ── GEE export ────────────────────────────────────────────────────────────────
-
-# CA/OR fires from MTBS, 2018–2022
-# Format: (fire_name, year, pre_date_start, pre_date_end, post_date_start, post_date_end, lon, lat, buffer_km)
+# fires to process: name, year, pre start/end, post start/end, lon, lat, buffer_km
 FIRES = [
     ("camp_fire",      2018, "2018-08-01", "2018-11-07", "2018-11-09", "2019-01-01", -121.57, 39.81, 25),
     ("dixie_fire",     2021, "2021-05-01", "2021-07-13", "2021-07-15", "2021-11-01", -121.15, 40.00, 40),
@@ -24,8 +12,7 @@ FIRES = [
     ("august_complex", 2020, "2020-06-01", "2020-08-16", "2020-08-18", "2020-12-01", -122.80, 39.80, 50),
 ]
 
-BANDS = ["B2", "B3", "B4", "B5", "B6", "B7"]  # Blue, Green, Red, NIR, SWIR1, SWIR2
-BAND_NAMES = ["blue", "green", "red", "nir", "swir1", "swir2"]
+BANDS = ["B2", "B3", "B4", "B5", "B6", "B7"]
 
 
 def init_gee():
@@ -34,17 +21,16 @@ def init_gee():
 
 
 def get_landsat_image(lon, lat, buffer_km, date_start, date_end):
-    """Return a cloud-masked Landsat 8 median composite for a region and date range."""
     import ee
     point = ee.Geometry.Point([lon, lat])
     region = point.buffer(buffer_km * 1000).bounds()
 
     def mask_clouds(image):
         qa = image.select("QA_PIXEL")
-        cloud_mask = qa.bitwiseAnd(1 << 3).eq(0).And(qa.bitwiseAnd(1 << 4).eq(0))
-        return image.updateMask(cloud_mask)
+        mask = qa.bitwiseAnd(1 << 3).eq(0).And(qa.bitwiseAnd(1 << 4).eq(0))
+        return image.updateMask(mask)
 
-    collection = (
+    img = (
         ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
         .filterBounds(region)
         .filterDate(date_start, date_end)
@@ -53,14 +39,12 @@ def get_landsat_image(lon, lat, buffer_km, date_start, date_end):
         .median()
         .clip(region)
     )
-    return collection, region
+    return img, region
 
 
 def export_fire_pair(fire_name, year, pre_start, pre_end, post_start, post_end, lon, lat, buffer_km, output_dir):
-    """Export pre and post fire Landsat 8 images to Google Drive."""
     import ee
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     pre_img, region = get_landsat_image(lon, lat, buffer_km, pre_start, pre_end)
     post_img, _ = get_landsat_image(lon, lat, buffer_km, post_start, post_end)
@@ -77,7 +61,7 @@ def export_fire_pair(fire_name, year, pre_start, pre_end, post_start, post_end, 
             maxPixels=1e9,
         )
         task.start()
-        print(f"Exported {fire_name} {label} → Google Drive/cs131_wildfire/")
+        print(f"started export: {fire_name} {label}")
 
 
 def export_all_fires(output_dir="data/raw"):
@@ -86,34 +70,23 @@ def export_all_fires(output_dir="data/raw"):
         export_fire_pair(*fire, output_dir=output_dir)
 
 
-# ── SIFT alignment ─────────────────────────────────────────────────────────────
-
 def load_tiff(path):
-    """Load a multiband GeoTIFF, return (H, W, C) float32 array + rasterio profile."""
     with rasterio.open(path) as src:
-        data = src.read().astype(np.float32)  # (C, H, W)
+        data = src.read().astype(np.float32)
         profile = src.profile
-    return np.transpose(data, (1, 2, 0)), profile  # (H, W, C)
+    return np.transpose(data, (1, 2, 0)), profile
 
 
 def normalize_band(band):
-    """Min-max normalize a single band to [0, 1]."""
     b_min, b_max = np.nanpercentile(band, 2), np.nanpercentile(band, 98)
     return np.clip((band - b_min) / (b_max - b_min + 1e-8), 0, 1)
 
 
 def to_uint8(band_norm):
-    """Convert normalized [0,1] float to uint8 for SIFT."""
     return (band_norm * 255).astype(np.uint8)
 
 
 def sift_align(pre_img, post_img):
-    """
-    Align post_img to pre_img using SIFT feature matching + homography.
-    Both inputs: (H, W, C) float32.
-    Returns aligned post_img as (H, W, C) float32.
-    """
-    # Use red band (index 2) for matching
     pre_gray = to_uint8(normalize_band(pre_img[:, :, 2]))
     post_gray = to_uint8(normalize_band(post_img[:, :, 2]))
 
@@ -121,23 +94,21 @@ def sift_align(pre_img, post_img):
     kp1, des1 = sift.detectAndCompute(pre_gray, None)
     kp2, des2 = sift.detectAndCompute(post_gray, None)
 
-    # BFMatcher with ratio test
     bf = cv2.BFMatcher(cv2.NORM_L2)
     raw_matches = bf.knnMatch(des1, des2, k=2)
     good = [m for m, n in raw_matches if m.distance < 0.75 * n.distance]
 
-    print(f"  SIFT: {len(kp1)} / {len(kp2)} keypoints, {len(good)} good matches")
+    print(f"  SIFT: {len(kp1)}/{len(kp2)} keypoints, {len(good)} good matches")
 
     if len(good) < 10:
-        print("  Warning: too few matches, returning unaligned post image")
+        print("  too few matches, skipping alignment")
         return post_img
 
     src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
     dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
     H, mask = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
-    inliers = int(mask.sum())
-    print(f"  Homography inliers: {inliers} / {len(good)}")
+    print(f"  homography inliers: {int(mask.sum())}/{len(good)}")
 
     h, w = pre_img.shape[:2]
     aligned = np.stack([
@@ -149,14 +120,12 @@ def sift_align(pre_img, post_img):
 
 
 def normalize_pair(pre_img, post_img):
-    """Per-band percentile normalization for both images."""
     pre_norm = np.stack([normalize_band(pre_img[:, :, c]) for c in range(pre_img.shape[2])], axis=2)
     post_norm = np.stack([normalize_band(post_img[:, :, c]) for c in range(post_img.shape[2])], axis=2)
     return pre_norm, post_norm
 
 
 def save_tiff(array, profile, path):
-    """Save (H, W, C) float32 array as GeoTIFF."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     profile.update(count=array.shape[2], dtype=rasterio.float32)
@@ -165,25 +134,21 @@ def save_tiff(array, profile, path):
 
 
 def preprocess_fire(fire_name, year, raw_dir="data/raw", processed_dir="data/processed"):
-    """Load raw tiffs, SIFT-align, normalize, and save processed pair."""
     raw_dir = Path(raw_dir)
     pre_path = raw_dir / f"{fire_name}_pre_{year}.tif"
     post_path = raw_dir / f"{fire_name}_post_{year}.tif"
 
-    print(f"\nProcessing {fire_name} {year}...")
+    print(f"processing {fire_name} {year}...")
     pre_img, profile = load_tiff(pre_path)
     post_img, _ = load_tiff(post_path)
 
-    print("  Aligning with SIFT...")
     post_aligned = sift_align(pre_img, post_img)
-
-    print("  Normalizing bands...")
     pre_norm, post_norm = normalize_pair(pre_img, post_aligned)
 
     out_dir = Path(processed_dir) / fire_name
     save_tiff(pre_norm, profile, out_dir / "pre.tif")
     save_tiff(post_norm, profile, out_dir / "post.tif")
-    print(f"  Saved to {out_dir}")
+    print(f"  saved to {out_dir}")
 
     return pre_norm, post_norm, profile
 
