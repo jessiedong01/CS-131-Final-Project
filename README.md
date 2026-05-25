@@ -1,5 +1,5 @@
 # Wildfire Burn Severity Mapping via Satellite Imagery
-CS 131 Final Project — Spring 2026
+CS 131 Final Project
 
 ## Overview
 Automated burn severity classification using classical CV and deep learning on multispectral Landsat 8 imagery. Compares a classical pipeline (Gaussian filtering → Canny edge detection → Otsu thresholding on dNBR) against a U-Net segmentation model trained on raw multispectral bands.
